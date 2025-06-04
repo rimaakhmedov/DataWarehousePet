@@ -1,0 +1,185 @@
+x-airflow-common:
+  &airflow-common
+  image: apache/airflow:2.10.3
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres_airflow/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres_airflow/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
+    _PIP_ADDITIONAL_REQUIREMENTS: pandas boto3 faker apache-airflow-providers-apache-spark apache-airflow-providers-postgres
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./spark_jobs:/opt/airflow/spark_jobs
+    - /var/run/docker.sock:/var/run/docker.sock
+    - ./.env:/opt/airflow/.env
+    - ./data:/opt/airflow/data
+  networks:
+    - dwh_network
+  depends_on:
+    postgres_airflow:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  spark-master:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    ports:
+      - "7077:7077"   # Spark master port
+      - "8082:8080"   # Spark master web UI
+    networks:
+      - dwh_network
+    volumes:
+      - ./spark_jobs:/opt/airflow/spark_jobs
+      - ./.env:/opt/airflow/.env
+
+  spark-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    depends_on:
+        - spark-master
+    environment:
+        - SPARK_MODE=worker
+        - SPARK_MASTER_URL=spark://spark-master:7077
+        - SPARK_RPC_AUTHENTICATION_ENABLED=no
+        - SPARK_RPC_ENCRYPTION_ENABLED=no
+        - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+        - SPARK_SSL_ENABLED=no
+    ports:
+        - "8083:8081"
+    networks:
+        - dwh_network
+    volumes:
+        - ./spark_jobs:/opt/airflow/spark_jobs
+        - ./.env:/opt/airflow/.env
+
+  postgres_airflow:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_airflow-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+    ports:
+      - "5434:5432"
+    networks:
+      - dwh_network
+
+  postgres_dwh:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: dwh
+      POSTGRES_PASSWORD: dwh
+      POSTGRES_DB: dwh
+    volumes:
+      - postgres_dwh-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-U", "dwh" ]
+      interval: 10s
+      retries: 5
+    ports:
+      - "5435:5432"
+    networks:
+      - dwh_network
+
+  redis:
+    image: redis:7.2-bookworm
+    expose:
+      - 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+    networks:
+      - dwh_network
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+
+  airflow-worker:
+    <<: *airflow-common
+    command: celery worker
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /sources/logs /sources/dags /sources/plugins
+        chown -R "${AIRFLOW_UID:-50000}:0" /sources/{logs,dags,plugins}
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: airflow
+      _AIRFLOW_WWW_USER_PASSWORD: airflow
+    user: "0:0"
+    volumes:
+      - .:/sources
+
+  minio:
+    image: minio/minio:latest
+    command: server --console-address ":9001" /data/
+    environment:
+        MINIO_ROOT_USER: minio_admin_user
+        MINIO_ROOT_PASSWORD: minio_admin_user
+    ports:
+        - "9000:9000"
+        - "9001:9001"
+    volumes:
+        - minio_data:/data
+    networks:
+        - dwh_network
+    healthcheck:
+        test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
+        interval: 10s
+        timeout: 5s
+        retries: 5
+
+networks:
+  dwh_network:
+
+volumes:
+  postgres_dwh-db-volume:
+  postgres_airflow-db-volume:
+  minio_data:
+  spark_jobs:
